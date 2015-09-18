@@ -110,6 +110,17 @@ extern int debug_level;
 				expr); \
 	} while (0)
 
+#define PREF_COLOR "\033["
+#define GREEN PREF_COLOR "1;32m"
+#define RED PREF_COLOR "1;31m"
+#define DEFAULT PREF_COLOR "0m"
+
+#define LOG_SYSCALL(pid_value, tgid_value, comm_value, syscall_id, expr ...) \
+  LOG_INFO("["GREEN"[pid]%d [tgid]%d [comm]%s" \
+  DEFAULT"] "RED"%s"DEFAULT"(%s)", \
+  pid_value, tgid_value, comm_value, \
+  syscalls_map[syscall_id], expr)
+
 #define LOG_INFO(expr ...) \
 	log_printf_lf(LOG_LVL_INFO, __FILE__, __LINE__, __func__, expr)
 

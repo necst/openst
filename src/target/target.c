@@ -2,7 +2,7 @@
  *   Copyright (C) 2005 by Dominic Rath                                    *
  *   Dominic.Rath@gmx.de                                                   *
  *                                                                         *
- *   Copyright (C) 2007-2010 Øyvind Harboe                                 *
+ *   Copyright (C) 2007-2010 Øyvind Harboe                               *
  *   oyvind.harboe@zylin.com                                               *
  *                                                                         *
  *   Copyright (C) 2008, Duane Ellis                                       *
@@ -46,7 +46,10 @@
 #include <helper/time_support.h>
 #include <jtag/jtag.h>
 #include <flash/nor/core.h>
+#include <time.h>
+#include <sys/wait.h>
 
+#include "arm.h"
 #include "target.h"
 #include "target_type.h"
 #include "target_request.h"
@@ -56,6 +59,7 @@
 #include "image.h"
 #include "rtos/rtos.h"
 #include "transport/transport.h"
+#include "systrace.h"
 
 /* default halt wait timeout (ms) */
 #define DEFAULT_HALT_TIMEOUT 5000
@@ -135,6 +139,17 @@ static struct target_type *target_types[] = {
 	&quark_x10xx_target,
 	NULL,
 };
+
+/* systrace vars */
+static void initialize_systrace_breakpoint(void);
+static void initialize_systrace_data(void);
+static void insert_dump_functions_references(void);
+
+static struct breakpoint *breakpoint_p;
+static char* (*sys_ptr[NUM_SYSCALLS])(int depth, struct target *target);
+uint32_t depth_level = 0;
+uint32_t traced_pid = 0;
+char traced_comm[24] = "";
 
 struct target *all_targets;
 static struct target_event_callback *target_event_callbacks;
@@ -304,6 +319,7 @@ const char *target_reset_mode_name(enum target_reset_mode reset_mode)
 	}
 	return cp;
 }
+
 
 /* determine the number of the new target */
 static int new_target_number(void)
@@ -1291,6 +1307,9 @@ COMMAND_HANDLER(handle_target_init_command)
 	if (CMD_ARGC != 0)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
+	/* systrace call init */
+	initialize_systrace_data();
+
 	static bool target_initialized;
 	if (target_initialized) {
 		LOG_INFO("'target init' has already been called");
@@ -1451,10 +1470,482 @@ int target_unregister_timer_callback(int (*callback)(void *priv), void *priv)
 	return ERROR_FAIL;
 }
 
+uint32_t get_uint32_t_register_by_name(struct reg_cache *cache, const char *name)
+{
+	struct reg *reg;
+	char *value;
+	uint32_t retval;
+
+	reg = register_get_by_name(cache, name, 1);
+	value = buf_to_str(reg->value, reg->size, 16);
+
+	int i = 0, aux;
+	retval = 0;
+	for (i=0; i<8; i++)
+	{
+		aux = (int)value[i];
+		retval |= (((64 < aux) ? aux-55 : aux-48) << (28-4*i));
+	}
+
+	return retval;
+}
+
+static void* get_address_value(struct target *target, uint32_t address, uint32_t size)
+{
+	uint8_t *buffer = calloc(1, size);
+//	uint32_t value;
+
+	target_read_memory(target, address, size, 1, buffer);
+//	memcpy(&value, &(buffer[0]), size);
+
+	return (void*)buffer;
+//	return value;
+}
+
+static uint8_t* get_address_string(struct target *target, uint32_t address)
+{
+	uint8_t *buffer = (uint8_t*) malloc(MAX_MEM_READ * sizeof(uint8_t));
+	unsigned j;
+
+	j = -1;
+	do {
+		j++;
+		target_read_memory(target, address+j, BYTE_SIZE, 1, buffer+j);
+	} while ( *(buffer+j) && j < MAX_MEM_READ );
+
+	return buffer;
+}
+
+#include "testcode.c"
+
+/* systrace initialization */
+static void initialize_systrace_breakpoint(void)
+{
+	breakpoint_p = (struct breakpoint*) malloc(sizeof(struct breakpoint));
+	breakpoint_p->address = SWI_ADDR;
+	breakpoint_p->asid = 0; 
+	breakpoint_p->length = BKPT_LENGTH;
+	breakpoint_p->type = BKPT_HARD;
+	breakpoint_p->set = 0;
+	breakpoint_p->orig_instr = malloc(BKPT_LENGTH);
+	breakpoint_p->next = NULL;
+	breakpoint_p->unique_id = 0;
+}
+
+static void insert_dump_functions_references(void)
+{
+    sys_ptr[66] = &dump_sys_setsid;
+    sys_ptr[72] = &dump_sys_sigsuspend;
+    sys_ptr[67] = &dump_sys_sigaction;
+    sys_ptr[119] = &dump_sys_sigreturn;
+    sys_ptr[173] = &dump_sys_rt_sigreturn;
+    sys_ptr[2] = &dump_sys_fork;
+    sys_ptr[120] = &dump_sys_clone;
+    sys_ptr[190] = &dump_sys_vfork;
+    sys_ptr[11] = &dump_sys_execve;
+    sys_ptr[270] = &dump_sys_arm_fadvise64_64;
+    sys_ptr[195] = &dump_sys_oabi_stat64;
+    sys_ptr[196] = &dump_sys_oabi_lstat64;
+    sys_ptr[197] = &dump_sys_oabi_fstat64;
+    sys_ptr[327] = &dump_sys_oabi_fstatat64;
+    sys_ptr[221] = &dump_sys_oabi_fcntl64;
+    sys_ptr[251] = &dump_sys_oabi_epoll_ctl;
+    sys_ptr[252] = &dump_sys_oabi_epoll_wait;
+    sys_ptr[312] = &dump_sys_oabi_semtimedop;
+    sys_ptr[298] = &dump_sys_oabi_semop;
+    sys_ptr[117] = &dump_sys_oabi_ipc;
+    sys_ptr[282] = &dump_sys_oabi_bind;
+    sys_ptr[283] = &dump_sys_oabi_connect;
+    sys_ptr[290] = &dump_sys_oabi_sendto;
+    sys_ptr[296] = &dump_sys_oabi_sendmsg;
+    sys_ptr[102] = &dump_sys_oabi_socketcall;
+    sys_ptr[34] = &dump_sys_nice;
+    sys_ptr[156] = &dump_sys_sched_setscheduler;
+    sys_ptr[154] = &dump_sys_sched_setparam;
+    sys_ptr[157] = &dump_sys_sched_getscheduler;
+    sys_ptr[155] = &dump_sys_sched_getparam;
+    sys_ptr[241] = &dump_sys_sched_setaffinity;
+    sys_ptr[242] = &dump_sys_sched_getaffinity;
+    sys_ptr[158] = &dump_sys_sched_yield;
+    sys_ptr[159] = &dump_sys_sched_get_priority_max;
+    sys_ptr[160] = &dump_sys_sched_get_priority_min;
+    sys_ptr[161] = &dump_sys_sched_rr_get_interval;
+    sys_ptr[256] = &dump_sys_set_tid_address;
+    sys_ptr[337] = &dump_sys_unshare;
+    sys_ptr[136] = &dump_sys_personality;
+    sys_ptr[103] = &dump_sys_syslog;
+    sys_ptr[1] = &dump_sys_exit;
+    sys_ptr[248] = &dump_sys_exit_group;
+    sys_ptr[280] = &dump_sys_waitid;
+    sys_ptr[114] = &dump_sys_wait4;
+    sys_ptr[105] = &dump_sys_getitimer;
+    sys_ptr[104] = &dump_sys_setitimer;
+    sys_ptr[13] = &dump_sys_time;
+    sys_ptr[25] = &dump_sys_stime;
+    sys_ptr[78] = &dump_sys_gettimeofday;
+    sys_ptr[79] = &dump_sys_settimeofday;
+    sys_ptr[124] = &dump_sys_adjtimex;
+    sys_ptr[149] = &dump_sys_sysctl;
+    sys_ptr[184] = &dump_sys_capget;
+    sys_ptr[185] = &dump_sys_capset;
+    sys_ptr[26] = &dump_sys_ptrace;
+    sys_ptr[27] = &dump_sys_alarm;
+    sys_ptr[20] = &dump_sys_getpid;
+    sys_ptr[64] = &dump_sys_getppid;
+    sys_ptr[199] = &dump_sys_getuid;
+    sys_ptr[201] = &dump_sys_geteuid;
+    sys_ptr[200] = &dump_sys_getgid;
+    sys_ptr[202] = &dump_sys_getegid;
+    sys_ptr[224] = &dump_sys_gettid;
+    sys_ptr[116] = &dump_sys_sysinfo;
+    sys_ptr[0] = &dump_sys_restart_syscall;
+    sys_ptr[175] = &dump_sys_rt_sigprocmask;
+    sys_ptr[176] = &dump_sys_rt_sigpending;
+    sys_ptr[177] = &dump_sys_rt_sigtimedwait;
+    sys_ptr[37] = &dump_sys_kill;
+    sys_ptr[268] = &dump_sys_tgkill;
+    sys_ptr[238] = &dump_sys_tkill;
+    sys_ptr[178] = &dump_sys_rt_sigqueueinfo;
+    sys_ptr[363] = &dump_sys_rt_tgsigqueueinfo;
+    sys_ptr[73] = &dump_sys_sigpending;
+    sys_ptr[126] = &dump_sys_sigprocmask;
+    sys_ptr[174] = &dump_sys_rt_sigaction;
+    sys_ptr[29] = &dump_sys_pause;
+    sys_ptr[179] = &dump_sys_rt_sigsuspend;
+    sys_ptr[97] = &dump_sys_setpriority;
+    sys_ptr[96] = &dump_sys_getpriority;
+    sys_ptr[88] = &dump_sys_reboot;
+    sys_ptr[204] = &dump_sys_setregid;
+    sys_ptr[214] = &dump_sys_setgid;
+    sys_ptr[203] = &dump_sys_setreuid;
+    sys_ptr[213] = &dump_sys_setuid;
+    sys_ptr[208] = &dump_sys_setresuid;
+    sys_ptr[209] = &dump_sys_getresuid;
+    sys_ptr[210] = &dump_sys_setresgid;
+    sys_ptr[211] = &dump_sys_getresgid;
+    sys_ptr[215] = &dump_sys_setfsuid;
+    sys_ptr[216] = &dump_sys_setfsgid;
+    sys_ptr[43] = &dump_sys_times;
+    sys_ptr[57] = &dump_sys_setpgid;
+    sys_ptr[132] = &dump_sys_getpgid;
+    sys_ptr[65] = &dump_sys_getpgrp;
+    sys_ptr[147] = &dump_sys_getsid;
+    sys_ptr[122] = &dump_sys_newuname;
+    sys_ptr[74] = &dump_sys_sethostname;
+    sys_ptr[121] = &dump_sys_setdomainname;
+    sys_ptr[76] = &dump_sys_old_getrlimit;
+    sys_ptr[191] = &dump_sys_getrlimit;
+    sys_ptr[369] = &dump_sys_prlimit64;
+    sys_ptr[75] = &dump_sys_setrlimit;
+    sys_ptr[77] = &dump_sys_getrusage;
+    sys_ptr[60] = &dump_sys_umask;
+    sys_ptr[172] = &dump_sys_prctl;
+    sys_ptr[345] = &dump_sys_getcpu;
+    sys_ptr[257] = &dump_sys_timer_create;
+    sys_ptr[259] = &dump_sys_timer_gettime;
+    sys_ptr[260] = &dump_sys_timer_getoverrun;
+    sys_ptr[258] = &dump_sys_timer_settime;
+    sys_ptr[261] = &dump_sys_timer_delete;
+    sys_ptr[262] = &dump_sys_clock_settime;
+    sys_ptr[263] = &dump_sys_clock_gettime;
+    sys_ptr[372] = &dump_sys_clock_adjtime;
+    sys_ptr[264] = &dump_sys_clock_getres;
+    sys_ptr[265] = &dump_sys_clock_nanosleep;
+    sys_ptr[7] = &dump_sys_ni_syscall;
+    sys_ptr[17] = &dump_sys_ni_syscall;
+    sys_ptr[18] = &dump_sys_ni_syscall;
+    sys_ptr[28] = &dump_sys_ni_syscall;
+    sys_ptr[31] = &dump_sys_ni_syscall;
+    sys_ptr[32] = &dump_sys_ni_syscall;
+    sys_ptr[35] = &dump_sys_ni_syscall;
+    sys_ptr[44] = &dump_sys_ni_syscall;
+    sys_ptr[48] = &dump_sys_ni_syscall;
+    sys_ptr[53] = &dump_sys_ni_syscall;
+    sys_ptr[56] = &dump_sys_ni_syscall;
+    sys_ptr[58] = &dump_sys_ni_syscall;
+    sys_ptr[59] = &dump_sys_ni_syscall;
+    sys_ptr[68] = &dump_sys_ni_syscall;
+    sys_ptr[69] = &dump_sys_ni_syscall;
+    sys_ptr[84] = &dump_sys_ni_syscall;
+    sys_ptr[98] = &dump_sys_ni_syscall;
+    sys_ptr[101] = &dump_sys_ni_syscall;
+    sys_ptr[109] = &dump_sys_ni_syscall;
+    sys_ptr[110] = &dump_sys_ni_syscall;
+    sys_ptr[112] = &dump_sys_ni_syscall;
+    sys_ptr[123] = &dump_sys_ni_syscall;
+    sys_ptr[127] = &dump_sys_ni_syscall;
+    sys_ptr[130] = &dump_sys_ni_syscall;
+    sys_ptr[137] = &dump_sys_ni_syscall;
+    sys_ptr[166] = &dump_sys_ni_syscall;
+    sys_ptr[167] = &dump_sys_ni_syscall;
+    sys_ptr[169] = &dump_sys_ni_syscall;
+    sys_ptr[188] = &dump_sys_ni_syscall;
+    sys_ptr[189] = &dump_sys_ni_syscall;
+    sys_ptr[222] = &dump_sys_ni_syscall;
+    sys_ptr[223] = &dump_sys_ni_syscall;
+    sys_ptr[254] = &dump_sys_ni_syscall;
+    sys_ptr[255] = &dump_sys_ni_syscall;
+    sys_ptr[313] = &dump_sys_ni_syscall;
+    sys_ptr[162] = &dump_sys_nanosleep;
+    sys_ptr[375] = &dump_sys_setns;
+    sys_ptr[205] = &dump_sys_getgroups;
+    sys_ptr[206] = &dump_sys_setgroups;
+    sys_ptr[338] = &dump_sys_set_robust_list;
+    sys_ptr[339] = &dump_sys_get_robust_list;
+    sys_ptr[240] = &dump_sys_futex;
+    sys_ptr[182] = &dump_sys_chown16;
+    sys_ptr[16] = &dump_sys_lchown16;
+    sys_ptr[95] = &dump_sys_fchown16;
+    sys_ptr[71] = &dump_sys_setregid16;
+    sys_ptr[46] = &dump_sys_setgid16;
+    sys_ptr[70] = &dump_sys_setreuid16;
+    sys_ptr[23] = &dump_sys_setuid16;
+    sys_ptr[164] = &dump_sys_setresuid16;
+    sys_ptr[165] = &dump_sys_getresuid16;
+    sys_ptr[170] = &dump_sys_setresgid16;
+    sys_ptr[171] = &dump_sys_getresgid16;
+    sys_ptr[138] = &dump_sys_setfsuid16;
+    sys_ptr[139] = &dump_sys_setfsgid16;
+    sys_ptr[80] = &dump_sys_getgroups16;
+    sys_ptr[81] = &dump_sys_setgroups16;
+    sys_ptr[24] = &dump_sys_getuid16;
+    sys_ptr[49] = &dump_sys_geteuid16;
+    sys_ptr[47] = &dump_sys_getgid16;
+    sys_ptr[50] = &dump_sys_getegid16;
+    sys_ptr[129] = &dump_sys_delete_module;
+    sys_ptr[128] = &dump_sys_init_module;
+    sys_ptr[36] = &dump_sys_sync;
+    sys_ptr[51] = &dump_sys_acct;
+    sys_ptr[347] = &dump_sys_kexec_load;
+    sys_ptr[364] = &dump_sys_perf_event_open;
+    sys_ptr[225] = &dump_sys_readahead;
+    sys_ptr[253] = &dump_sys_remap_file_pages;
+    sys_ptr[220] = &dump_sys_madvise;
+    sys_ptr[219] = &dump_sys_mincore;
+    sys_ptr[150] = &dump_sys_mlock;
+    sys_ptr[151] = &dump_sys_munlock;
+    sys_ptr[152] = &dump_sys_mlockall;
+    sys_ptr[153] = &dump_sys_munlockall;
+    sys_ptr[45] = &dump_sys_brk;
+    sys_ptr[90] = &dump_sys_old_mmap;
+    sys_ptr[91] = &dump_sys_munmap;
+    sys_ptr[125] = &dump_sys_mprotect;
+    sys_ptr[163] = &dump_sys_mremap;
+    sys_ptr[144] = &dump_sys_msync;
+    sys_ptr[376] = &dump_sys_process_vm_readv;
+    sys_ptr[377] = &dump_sys_process_vm_writev;
+    sys_ptr[87] = &dump_sys_swapon;
+    sys_ptr[115] = &dump_sys_swapoff;
+    sys_ptr[5] = &dump_sys_open;
+    sys_ptr[6] = &dump_sys_close;
+    sys_ptr[92] = &dump_sys_truncate;
+    sys_ptr[93] = &dump_sys_ftruncate;
+    sys_ptr[193] = &dump_sys_truncate64;
+    sys_ptr[194] = &dump_sys_ftruncate64;
+    sys_ptr[352] = &dump_sys_fallocate;
+    sys_ptr[334] = &dump_sys_faccessat;
+    sys_ptr[33] = &dump_sys_access;
+    sys_ptr[12] = &dump_sys_chdir;
+    sys_ptr[133] = &dump_sys_fchdir;
+    sys_ptr[61] = &dump_sys_chroot;
+    sys_ptr[94] = &dump_sys_fchmod;
+    sys_ptr[333] = &dump_sys_fchmodat;
+    sys_ptr[15] = &dump_sys_chmod;
+    sys_ptr[212] = &dump_sys_chown;
+    sys_ptr[325] = &dump_sys_fchownat;
+    sys_ptr[198] = &dump_sys_lchown;
+    sys_ptr[207] = &dump_sys_fchown;
+    sys_ptr[322] = &dump_sys_openat;
+    sys_ptr[8] = &dump_sys_creat;
+    sys_ptr[111] = &dump_sys_vhangup;
+    sys_ptr[19] = &dump_sys_lseek;
+    sys_ptr[140] = &dump_sys_llseek;
+    sys_ptr[3] = &dump_sys_read;
+    sys_ptr[4] = &dump_sys_write;
+    sys_ptr[180] = &dump_sys_pread64;
+    sys_ptr[181] = &dump_sys_pwrite64;
+    sys_ptr[145] = &dump_sys_readv;
+    sys_ptr[146] = &dump_sys_writev;
+    sys_ptr[361] = &dump_sys_preadv;
+    sys_ptr[362] = &dump_sys_pwritev;
+    sys_ptr[187] = &dump_sys_sendfile;
+    sys_ptr[239] = &dump_sys_sendfile64;
+    sys_ptr[106] = &dump_sys_newstat;
+    sys_ptr[107] = &dump_sys_newlstat;
+    sys_ptr[108] = &dump_sys_newfstat;
+    sys_ptr[332] = &dump_sys_readlinkat;
+    sys_ptr[85] = &dump_sys_readlink;
+    sys_ptr[195] = &dump_sys_stat64;
+    sys_ptr[196] = &dump_sys_lstat64;
+    sys_ptr[197] = &dump_sys_fstat64;
+    sys_ptr[327] = &dump_sys_fstatat64;
+    sys_ptr[86] = &dump_sys_uselib;
+    sys_ptr[359] = &dump_sys_pipe2;
+    sys_ptr[42] = &dump_sys_pipe;
+    sys_ptr[324] = &dump_sys_mknodat;
+    sys_ptr[14] = &dump_sys_mknod;
+    sys_ptr[323] = &dump_sys_mkdirat;
+    sys_ptr[39] = &dump_sys_mkdir;
+    sys_ptr[40] = &dump_sys_rmdir;
+    sys_ptr[328] = &dump_sys_unlinkat;
+    sys_ptr[10] = &dump_sys_unlink;
+    sys_ptr[331] = &dump_sys_symlinkat;
+    sys_ptr[83] = &dump_sys_symlink;
+    sys_ptr[330] = &dump_sys_linkat;
+    sys_ptr[9] = &dump_sys_link;
+    sys_ptr[329] = &dump_sys_renameat;
+    sys_ptr[38] = &dump_sys_rename;
+    sys_ptr[358] = &dump_sys_dup3;
+    sys_ptr[63] = &dump_sys_dup2;
+    sys_ptr[41] = &dump_sys_dup;
+    sys_ptr[55] = &dump_sys_fcntl;
+    sys_ptr[221] = &dump_sys_fcntl64;
+    sys_ptr[54] = &dump_sys_ioctl;
+    sys_ptr[89] = &dump_sys_old_readdir;
+    sys_ptr[141] = &dump_sys_getdents;
+    sys_ptr[217] = &dump_sys_getdents64;
+    sys_ptr[142] = &dump_sys_select;
+    sys_ptr[335] = &dump_sys_pselect6;
+    sys_ptr[82] = &dump_sys_old_select;
+    sys_ptr[168] = &dump_sys_poll;
+    sys_ptr[336] = &dump_sys_ppoll;
+    sys_ptr[183] = &dump_sys_getcwd;
+    sys_ptr[135] = &dump_sys_sysfs;
+    sys_ptr[52] = &dump_sys_umount;
+    sys_ptr[22] = &dump_sys_oldumount;
+    sys_ptr[21] = &dump_sys_mount;
+    sys_ptr[218] = &dump_sys_pivot_root;
+    sys_ptr[226] = &dump_sys_setxattr;
+    sys_ptr[227] = &dump_sys_lsetxattr;
+    sys_ptr[228] = &dump_sys_fsetxattr;
+    sys_ptr[229] = &dump_sys_getxattr;
+    sys_ptr[230] = &dump_sys_lgetxattr;
+    sys_ptr[231] = &dump_sys_fgetxattr;
+    sys_ptr[232] = &dump_sys_listxattr;
+    sys_ptr[233] = &dump_sys_llistxattr;
+    sys_ptr[234] = &dump_sys_flistxattr;
+    sys_ptr[235] = &dump_sys_removexattr;
+    sys_ptr[236] = &dump_sys_lremovexattr;
+    sys_ptr[237] = &dump_sys_fremovexattr;
+    sys_ptr[343] = &dump_sys_vmsplice;
+    sys_ptr[340] = &dump_sys_splice;
+    sys_ptr[342] = &dump_sys_tee;
+    sys_ptr[373] = &dump_sys_syncfs;
+    sys_ptr[118] = &dump_sys_fsync;
+    sys_ptr[148] = &dump_sys_fdatasync;
+    sys_ptr[341] = &dump_sys_sync_file_range2;
+    sys_ptr[30] = &dump_sys_utime;
+    sys_ptr[348] = &dump_sys_utimensat;
+    sys_ptr[326] = &dump_sys_futimesat;
+    sys_ptr[269] = &dump_sys_utimes;
+    sys_ptr[99] = &dump_sys_statfs;
+    sys_ptr[266] = &dump_sys_statfs64;
+    sys_ptr[100] = &dump_sys_fstatfs;
+    sys_ptr[267] = &dump_sys_fstatfs64;
+    sys_ptr[62] = &dump_sys_ustat;
+    sys_ptr[134] = &dump_sys_bdflush;
+    sys_ptr[314] = &dump_sys_ioprio_set;
+    sys_ptr[315] = &dump_sys_ioprio_get;
+    sys_ptr[360] = &dump_sys_inotify_init1;
+    sys_ptr[316] = &dump_sys_inotify_init;
+    sys_ptr[317] = &dump_sys_inotify_add_watch;
+    sys_ptr[318] = &dump_sys_inotify_rm_watch;
+    sys_ptr[357] = &dump_sys_epoll_create1;
+    sys_ptr[250] = &dump_sys_epoll_create;
+    sys_ptr[251] = &dump_sys_epoll_ctl;
+    sys_ptr[252] = &dump_sys_epoll_wait;
+    sys_ptr[346] = &dump_sys_epoll_pwait;
+    sys_ptr[355] = &dump_sys_signalfd4;
+    sys_ptr[349] = &dump_sys_signalfd;
+    sys_ptr[350] = &dump_sys_timerfd_create;
+    sys_ptr[353] = &dump_sys_timerfd_settime;
+    sys_ptr[354] = &dump_sys_timerfd_gettime;
+    sys_ptr[356] = &dump_sys_eventfd2;
+    sys_ptr[351] = &dump_sys_eventfd;
+    sys_ptr[243] = &dump_sys_io_setup;
+    sys_ptr[244] = &dump_sys_io_destroy;
+    sys_ptr[246] = &dump_sys_io_submit;
+    sys_ptr[247] = &dump_sys_io_cancel;
+    sys_ptr[245] = &dump_sys_io_getevents;
+    sys_ptr[143] = &dump_sys_flock;
+    sys_ptr[131] = &dump_sys_quotactl;
+    sys_ptr[249] = &dump_sys_lookup_dcookie;
+    sys_ptr[303] = &dump_sys_msgget;
+    sys_ptr[301] = &dump_sys_msgsnd;
+    sys_ptr[302] = &dump_sys_msgrcv;
+    sys_ptr[299] = &dump_sys_semget;
+    sys_ptr[300] = &dump_sys_semctl;
+    sys_ptr[312] = &dump_sys_semtimedop;
+    sys_ptr[298] = &dump_sys_semop;
+    sys_ptr[307] = &dump_sys_shmget;
+    sys_ptr[308] = &dump_sys_shmctl;
+    sys_ptr[305] = &dump_sys_shmat;
+    sys_ptr[306] = &dump_sys_shmdt;
+    sys_ptr[117] = &dump_sys_ipc;
+    sys_ptr[274] = &dump_sys_mq_open;
+    sys_ptr[275] = &dump_sys_mq_unlink;
+    sys_ptr[276] = &dump_sys_mq_timedsend;
+    sys_ptr[277] = &dump_sys_mq_timedreceive;
+    sys_ptr[278] = &dump_sys_mq_notify;
+    sys_ptr[279] = &dump_sys_mq_getsetattr;
+    sys_ptr[309] = &dump_sys_add_key;
+    sys_ptr[310] = &dump_sys_request_key;
+    sys_ptr[311] = &dump_sys_keyctl;
+    sys_ptr[289] = &dump_sys_send;
+    sys_ptr[291] = &dump_sys_recv;
+    sys_ptr[374] = &dump_sys_sendmmsg;
+    sys_ptr[281] = &dump_sys_socket;
+    sys_ptr[288] = &dump_sys_socketpair;
+    sys_ptr[282] = &dump_sys_bind;
+    sys_ptr[284] = &dump_sys_listen;
+    sys_ptr[366] = &dump_sys_accept4;
+    sys_ptr[285] = &dump_sys_accept;
+    sys_ptr[283] = &dump_sys_connect;
+    sys_ptr[286] = &dump_sys_getsockname;
+    sys_ptr[287] = &dump_sys_getpeername;
+    sys_ptr[290] = &dump_sys_sendto;
+    sys_ptr[292] = &dump_sys_recvfrom;
+    sys_ptr[294] = &dump_sys_setsockopt;
+    sys_ptr[295] = &dump_sys_getsockopt;
+    sys_ptr[293] = &dump_sys_shutdown;
+    sys_ptr[296] = &dump_sys_sendmsg;
+    sys_ptr[297] = &dump_sys_recvmsg;
+    sys_ptr[365] = &dump_sys_recvmmsg;
+    sys_ptr[102] = &dump_sys_socketcall;
+}
+
+static void initialize_systrace_data(void)
+{
+    int i;
+
+	initialize_systrace_breakpoint();
+
+    for (i=0; i<NUM_SYSCALLS; i++)
+    	sys_ptr[i] = NULL;
+
+	insert_dump_functions_references();
+}
+
 int target_call_event_callbacks(struct target *target, enum target_event event)
 {
 	struct target_event_callback *callback = target_event_callbacks;
 	struct target_event_callback *next_callback;
+	struct arm *arm;
+
+	char *param_str;
+
+	uint32_t pc_value,
+			sp_value,
+			syscall_id,
+			task_struct_addr,
+			task_struct_value,
+			pid_addr,
+			pid_value,
+			tgid_value,
+			comm_addr,
+			contextid = 0;
+
+	uint8_t *comm_value;
 
 	if (event == TARGET_EVENT_HALTED) {
 		/* execute early halted first */
@@ -1472,6 +1963,102 @@ int target_call_event_callbacks(struct target *target, enum target_event event)
 		callback = next_callback;
 	}
 
+//shandler
+	if(event == TARGET_EVENT_HALTED && target->debug_reason == DBG_REASON_BREAKPOINT)
+	{
+		/* PC reg info */
+		pc_value = get_uint32_t_register_by_name(target->reg_cache, "pc");
+
+		/* get syscall id (r7) */
+		syscall_id = get_uint32_t_register_by_name(target->reg_cache, "r7");
+
+//		LOG_INFO("\n[syscall_id]%u [pc]%x\n", syscall_id, pc_value);
+
+		static uint64_t begin = 0;
+    static uint64_t end = 0;
+		bool benchmark_micro = true;
+
+		if (!(syscall_id & 0xFFFF0000) && pc_value==SWI_ADDR)
+		{
+			begin = RDTSCNano();
+
+			/* SP reg info */
+			sp_value = get_uint32_t_register_by_name(target->reg_cache, "sp_svc");
+
+			/* sp_value & ~(KERNEL_THREAD_SIZE - 1) -> thread_info_addr */
+			task_struct_addr = (sp_value & ~(KERNEL_THREAD_SIZE - 1)) | TASK_STRUCT_OFFSET;
+
+			/* mdw task_struct_addr */
+			task_struct_value = *((uint32_t*) get_address_value(target, task_struct_addr, WORD_SIZE));
+
+			pid_addr = task_struct_value + PID_OFFSET;
+			comm_addr = task_struct_value + COMM_OFFSET;
+
+			/* mdw pid_addr */
+			pid_value = *((uint32_t*) get_address_value(target, pid_addr, WORD_SIZE));
+
+	   	/* mdw tgid_addr */
+    	tgid_value = *((uint32_t*) get_address_value(target, pid_addr+4, WORD_SIZE));
+
+	    /* mdw comm_addr */
+    	comm_value = get_address_string(target, comm_addr);
+
+	    if( (!traced_pid || (traced_pid == pid_value)) && (!strcmp(traced_comm, "") || !strcmp((const char *)comm_value, traced_comm)) )
+			{
+           	if(sys_ptr[syscall_id])
+           	{
+              		//LOG_INFO("[if] [%d]%s ", syscall_id, syscalls_map[syscall_id]);
+              		param_str = sys_ptr[syscall_id](depth_level, target);
+              		LOG_SYSCALL(pid_value, tgid_value, comm_value, syscall_id, param_str);
+              		free(param_str);
+           	} else {
+              		//LOG_INFO("[else] [%d]%s ", syscall_id, syscalls_map[syscall_id]);
+              		LOG_SYSCALL(pid_value, tgid_value, comm_value, syscall_id, "SYSCALL PARAMS");
+           	}
+			}
+			if ( traced_pid == pid_value || !strcmp((const char *)comm_value, traced_comm) )
+			{
+//				LOG_INFO(RED"%d || %d"DEFAULT, (traced_pid == pid_value), (!strcmp((const char *)comm_value, traced_comm)) );
+		    	// http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0434b/CIHBDHFH.html
+			 	// arm->mrc(target, cpnum, op1, op2, CRn, CRm, &value);
+			   	arm = target_to_arm(target);
+			   	arm->mrc(target, 15, 0, 1, 13, 0, &contextid);
+//			  	LOG_INFO(GREEN"[CONTEXTIDR]%x [PROCID]%d [ASID]%d"DEFAULT, value, (value >> 8), (value & 0xFF));
+			}
+		} else if(!(syscall_id & 0xFFFF0000) && pc_value==SWI_ADDR + 4)
+		{
+			if(benchmark_micro)
+      {
+				end = RDTSCNano();
+		    LOG_INFO(">%" PRIu64 "#", end - begin);
+      }
+		}
+		/* pc_value holds the address of the current breakpoint */
+		breakpoint_p->address = pc_value;
+		//target->type->remove_breakpoint(target, breakpoint_p);
+		breakpoint_remove(target, breakpoint_p->address);
+		breakpoint_p->address = (pc_value==SWI_ADDR) ? SWI_ADDR+4 : SWI_ADDR;
+
+		LOG_INFO("[CONTEXTID]%x, [BKP_P->ASID]%x", contextid, breakpoint_p->asid);
+		if ( !contextid && !breakpoint_p->asid ) {
+//			LOG_INFO("NORMAL");
+			breakpoint_add(target, breakpoint_p->address, BKPT_LENGTH, BKPT_HARD);
+		} else if( contextid ) {
+			breakpoint_p->asid = contextid;
+			hybrid_breakpoint_add(target, breakpoint_p->address, breakpoint_p->asid, BKPT_LENGTH, BKPT_HARD);
+		} else {
+			arm = target_to_arm(target);
+			arm->mrc(target, 15, 0, 1, 13, 0, &contextid);
+			breakpoint_p->asid = contextid;
+			hybrid_breakpoint_add(target, breakpoint_p->address, breakpoint_p->asid, BKPT_LENGTH, BKPT_HARD);
+		}
+
+		//target->type->add_breakpoint(target, breakpoint_p);
+		//target->type->add_hybrid_breakpoint(target, breakpoint_p);
+
+//		if (pc_value == SWI_ADDR)
+		target_resume(target, 1, 0, 1, 0); //target_resume(target, current, addr, handle_breakpoint, debug);
+	}
 	return ERROR_OK;
 }
 
@@ -2138,6 +2725,181 @@ int target_blank_check_memory(struct target *target, uint32_t address, uint32_t 
 	return retval;
 }
 
+int target_read_phys_u64(struct target *target, uint64_t address, uint64_t *value)
+{
+
+	uint8_t value_buf[8];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	int retval = target_read_phys_memory(target, address, 8, 1, value_buf);
+
+	if (retval != ERROR_OK) {
+		*value = 0;
+		LOG_DEBUG("address: 0x%" PRIx64 " failed", address);
+		return retval;
+	}
+	*value = target_buffer_get_u64(target, value_buf);
+	LOG_DEBUG("address: 0x%" PRIx64 ", value: 0x%16.16" PRIx64 "",
+			  address, *value);
+	return ERROR_OK;
+}
+
+int target_read_phys_u32(struct target *target, uint32_t address, uint32_t *value)
+{
+
+	uint8_t value_buf[4];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	int retval = target_read_phys_memory(target, address, 4, 1, value_buf);
+
+	if (retval != ERROR_OK) {
+		*value = 0;
+		LOG_DEBUG("address: 0x%8.8" PRIx32 " failed",
+				  address);
+		return retval;
+	}
+	*value = target_buffer_get_u32(target, value_buf);
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%8.8" PRIx32 "",
+			  address, *value);
+
+	return ERROR_OK;
+}
+
+int target_read_phys_u16(struct target *target, uint32_t address, uint16_t *value)
+{
+
+	uint8_t value_buf[2];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	int retval = target_read_phys_memory(target, address, 2, 1, value_buf);
+
+	if (retval != ERROR_OK) {
+		*value = 0;
+		LOG_DEBUG("address: 0x%8.8" PRIx32 " failed",
+				  address);
+		return retval;
+	}
+	*value = target_buffer_get_u16(target, value_buf);
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%4.4x",
+			  address,
+			  *value);
+
+	return ERROR_OK;
+}
+
+int target_read_phys_u8(struct target *target, uint32_t address, uint8_t *value)
+{
+
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	int retval = target_read_phys_memory(target, address, 1, 1, value);
+
+	if (retval != ERROR_OK) {
+		*value = 0;
+		LOG_DEBUG("address: 0x%8.8" PRIx32 " failed",
+				  address);
+		return retval;
+	}
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%2.2x",
+			  address,
+			  *value);
+
+	return ERROR_OK;
+}
+
+int target_write_phys_u64(struct target *target, uint64_t address, uint64_t value)
+{
+	int retval;
+	uint8_t value_buf[8];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	LOG_DEBUG("address: 0x%" PRIx64 ", value: 0x%16.16" PRIx64 "",
+			  address,
+			  value);
+
+	target_buffer_set_u64(target, value_buf, value);
+	retval = target_write_phys_memory(target, address, 8, 1, value_buf);
+	if (retval != ERROR_OK)
+		LOG_DEBUG("failed: %i", retval);
+
+	return retval;
+}
+
+int target_write_phys_u32(struct target *target, uint32_t address, uint32_t value)
+{
+	int retval;
+	uint8_t value_buf[4];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%8.8" PRIx32 "",
+			  address,
+			  value);
+
+	target_buffer_set_u32(target, value_buf, value);
+	retval = target_write_phys_memory(target, address, 4, 1, value_buf);
+	if (retval != ERROR_OK)
+		LOG_DEBUG("failed: %i", retval);
+
+	return retval;
+}
+
+int target_write_phys_u16(struct target *target, uint32_t address, uint16_t value)
+{
+	int retval;
+	uint8_t value_buf[2];
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%8.8x",
+			  address,
+			  value);
+
+	target_buffer_set_u16(target, value_buf, value);
+	retval = target_write_phys_memory(target, address, 2, 1, value_buf);
+	if (retval != ERROR_OK)
+		LOG_DEBUG("failed: %i", retval);
+
+	return retval;
+}
+
+int target_write_phys_u8(struct target *target, uint32_t address, uint8_t value)
+{
+	int retval;
+	if (!target_was_examined(target)) {
+		LOG_ERROR("Target not examined yet");
+		return ERROR_FAIL;
+	}
+
+	LOG_DEBUG("address: 0x%8.8" PRIx32 ", value: 0x%2.2x",
+			  address, value);
+
+	retval = target_write_phys_memory(target, address, 1, 1, &value);
+	if (retval != ERROR_OK)
+		LOG_DEBUG("failed: %i", retval);
+
+	return retval;
+}
+
 int target_read_u64(struct target *target, uint64_t address, uint64_t *value)
 {
 	uint8_t value_buf[8];
@@ -2522,29 +3284,27 @@ static int handle_target(void *priv)
 					target->backoff.times *= 2;
 					target->backoff.times++;
 				}
-				LOG_USER("Polling target %s failed, GDB will be halted. Polling again in %dms",
-						target_name(target),
-						target->backoff.times * polling_interval);
 
 				/* Tell GDB to halt the debugger. This allows the user to
 				 * run monitor commands to handle the situation.
 				 */
 				target_call_event_callbacks(target, TARGET_EVENT_GDB_HALT);
-				return retval;
 			}
-			/* Since we succeeded, we reset backoff count */
 			if (target->backoff.times > 0) {
-				LOG_USER("Polling target %s succeeded again, trying to reexamine", target_name(target));
+				LOG_USER("Polling target %s failed, trying to reexamine", target_name(target));
 				target_reset_examined(target);
 				retval = target_examine_one(target);
 				/* Target examination could have failed due to unstable connection,
 				 * but we set the examined flag anyway to repoll it later */
 				if (retval != ERROR_OK) {
 					target->examined = true;
+					LOG_USER("Examination failed, GDB will be halted. Polling again in %dms",
+						 target->backoff.times * polling_interval);
 					return retval;
 				}
 			}
 
+			/* Since we succeeded, we reset backoff count */
 			target->backoff.times = 0;
 		}
 	}
@@ -5895,6 +6655,161 @@ nextw:
 	return retval;
 }
 
+COMMAND_HANDLER(handle_pid_command)
+{
+// rosantos delete
+/*
+  struct target *target = get_current_target(CMD_CTX);
+      struct arm *arm;
+      arm = target_to_arm(target);
+      uint32_t value;
+      arm->mrc(target, 15, 0, 1, 13, 0, &value);
+      LOG_INFO(RED"[CONTEXTIDR]%x [PROCID]%d [ASID]%d"DEFAULT, value, (value >> 8), (value & 0xFF));
+*/
+ 
+  if (CMD_ARGC == 0) {
+    traced_pid = 0;
+	breakpoint_p->asid = 0;
+  } else {
+    parse_u32(CMD_ARGV[0], &traced_pid);
+  }
+  return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_comm_command)
+{
+  if (CMD_ARGC == 0) {
+    strcpy(traced_comm, "");
+	breakpoint_p->asid = 0;
+  } else {
+    strcpy(traced_comm, CMD_ARGV[0]);
+  }
+  return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_depth_command)
+{
+  if (CMD_ARGC == 0)
+    depth_level = 0; 
+  else 
+    COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], depth_level);
+
+  return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_start_command)
+{
+  if (CMD_ARGC == 0)
+    depth_level = 0;
+  else
+    COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], depth_level);
+
+
+	struct target *target = get_current_target(CMD_CTX);
+	int current = 1;
+	int addr = 0;
+
+	target_halt(target);
+	target_wait_state(target, TARGET_HALTED, DEFAULT_HALT_TIMEOUT);
+
+//	target->type->add_breakpoint(target, breakpoint_p);
+	breakpoint_add(target, SWI_ADDR, BKPT_LENGTH, BKPT_HARD);
+
+	target_resume(target, current, addr, 1, 0);
+
+  return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_stop_command)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	int current = 1;
+	int addr = 0;
+
+	target_halt(target);
+//	target_wait_state(target, TARGET_HALTED, DEFAULT_HALT_TIMEOUT);
+
+	//target->type->remove_breakpoint(target, breakpoint_p);
+	breakpoint_remove(target, breakpoint_p->address);
+
+	target_resume(target, current, addr, 1, 0);
+
+  return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_bench_command)
+{
+	//struct target *target = get_current_target(CMD_CTX);
+  const char *exec_path = CMD_ARGV[0];
+  char *exec_file = basename(exec_path);
+  char arg3[256];
+  int pid = fork();
+  if(pid == 0)
+  {
+    execlp("adb", "adb", "push", exec_path, "/bench", NULL);
+  }
+  wait(NULL);
+  strcpy(traced_comm, exec_file);
+  CMD_ARGC = 0;
+  CALL_COMMAND_HANDLER(handle_start_command);
+  pid = fork();
+  if(pid == 0)
+  {
+    snprintf(arg3, 256, "/bench/%s", exec_file);
+    execlp("adb", "adb", "shell", arg3, NULL);
+  }
+  // after adb shell stops, we do not need to trace anymore, right?
+// CALL_COMMAND_HANDLER(handle_stop_command);
+  
+  return ERROR_OK;
+}
+static const struct command_registration systrace_command_handlers[] = {
+	{
+		.name = "pid",
+		.handler = handle_pid_command,
+		.mode = COMMAND_EXEC,
+		.usage = "Filter by pid/comm, no argument for trace all",
+		.help = "[process_id/comm]",
+	},
+	{
+		.name = "comm",
+		.handler = handle_comm_command,
+		.mode = COMMAND_EXEC,
+		.usage = "Filter by pid/comm, no argument for trace all",
+		.help = "[process_id/comm]",
+	},
+	{
+		.name = "depth",
+		.handler = handle_depth_command,
+		.mode = COMMAND_EXEC,
+		.usage = "Change the desired depth level",
+		.help = "[depth_level]"
+	},
+	{
+		.name = "start",
+		.handler = handle_start_command,
+		.mode = COMMAND_EXEC,
+		.usage = "Start the tracing of the system-calls. depth_level is 0 by default",
+		.help = "depth_level",
+	},
+	{
+		.name = "stop",
+		.handler = handle_stop_command,
+		.mode = COMMAND_EXEC,
+		.usage = "Stop the tracing of the system-calls",
+		.help = "",
+	},
+	{
+		.name = "bench",
+		.handler = handle_bench_command,
+		.mode = COMMAND_EXEC,
+		.usage = "benchmark an executable",
+		.help = "",
+	},
+
+  COMMAND_REGISTRATION_DONE	
+};
+
 static const struct command_registration target_exec_command_handlers[] = {
 	{
 		.name = "fast_load_image",
@@ -6121,6 +7036,14 @@ static const struct command_registration target_exec_command_handlers[] = {
 		.help = "Test the target's memory access functions",
 		.usage = "size",
 	},
+	{
+		.name = "systrace",
+		.mode = COMMAND_EXEC,
+		.help = "something you wish you won't know",
+		.usage = "",
+    .chain = systrace_command_handlers,
+	},
+
 
 	COMMAND_REGISTRATION_DONE
 };
